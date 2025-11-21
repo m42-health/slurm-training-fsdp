@@ -5,15 +5,20 @@ __pycache__/
 *.so
 .Python
 
+# Benchmark cache
+.cache/
+
 # Virtual environments
 .venv/
 venv/
 ENV/
 env/
 
-# Training outputs
-checkpoints/
-logs/
+# Training outputs (ignore contents but keep directory structure)
+checkpoints/*
+!checkpoints/.gitkeep
+logs/*
+!logs/.gitkeep
 *.log
 
 # uv specific

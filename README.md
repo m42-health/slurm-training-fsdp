@@ -1,122 +1,127 @@
-# FSDP Training with PyTorch and Transformers
+# FSDP Training with Benchmarks
 
-Simple, readable PyTorch FSDP training script for multi-node SLURM clusters with ~4B parameter GPT2-style model.
+PyTorch FSDP training script for multi-node SLURM clusters with comprehensive benchmark suite to test cluster resources before training.
 
-## Quick Setup
+## Setup
 
 ```bash
-# Install uv (if not already installed)
+# Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create virtual environment and install dependencies
+# Create environment and install dependencies
 uv venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-## Submit Training Job
+## Usage
+
+### Full Run (Benchmarks + Training)
 
 ```bash
-# Edit slurm_submit.sh to match your cluster (nodes, GPUs, partition, etc.)
-# Then submit:
 sbatch slurm_submit.sh
 ```
 
-## Monitor Job
+This runs in two phases:
+1. **Benchmarks**: Tests storage, CPU, memory, GPU, and network
+2. **Training**: ~4B parameter GPT2-style model with FSDP
+
+### Benchmarks Only
+
+```bash
+sbatch benchmark_only.sh
+```
+
+### Monitor
 
 ```bash
 # Check job status
 squeue -u $USER
 
 # Watch logs
-tail -f logs/train_JOBID.out
+tail -f logs/train_*.out
+
+# View benchmark results (per rank in multi-node)
+cat logs/benchmark_*_rank*.yaml
 ```
 
 ## Configuration
 
-### SLURM Settings (slurm_submit.sh)
+### SLURM Settings
 
-Default configuration uses 4 nodes with 8 GPUs each (32 GPUs total):
+Edit `slurm_submit.sh` or `benchmark_only.sh`:
 
 ```bash
-#SBATCH --nodes=4
-#SBATCH --gpus-per-node=8
+#SBATCH --nodes=4              # Number of nodes
+#SBATCH --gpus-per-node=8      # GPUs per node
+#SBATCH --cpus-per-task=64     # CPUs per node
+#SBATCH --time=02:00:00        # Max runtime
+#SBATCH --partition=gpu        # Partition (uncomment and set)
 ```
 
-Adjust based on your cluster. Common configurations:
-- Single node: `--nodes=1 --gpus-per-node=8`
-- Two nodes: `--nodes=2 --gpus-per-node=8`
+### Training Settings
 
-### Training Settings (train.py)
-
-Key parameters you can adjust:
+Edit `train.py`:
 
 ```python
-# Model size (~4B params)
-n_embd=2560        # Embedding dimension
+n_embd=2560        # Model dimension
 n_layer=32         # Number of layers
 n_head=32          # Attention heads
-
-# Training
 batch_size=2       # Per-device batch size
 seq_length=512     # Sequence length
 num_epochs=3       # Training epochs
-lr=1e-4           # Learning rate
 ```
 
-## How It Works
+## Benchmarks
 
-- **Model**: ~4B parameter GPT2-style transformer
-- **Data**: Randomly generated dummy data (for testing)
-- **Distributed**: FSDP with full sharding across all GPUs
-- **Launcher**: `srun torchrun` for multi-node coordination
-- **Checkpointing**: Saves to `./checkpoints/final_checkpoint.pt`
+The benchmark suite tests:
+
+- **Storage I/O**: Sequential/parallel read/write, random IOPS
+- **CPU**: Multi-core stress, matrix ops, compression, sorting
+- **Memory**: Bandwidth and allocation performance
+- **GPU**: Memory bandwidth, compute (TFLOPS), all-reduce (multi-node)
+- **Network**: Node-to-node latency and bandwidth (multi-node)
+
+Results are saved to `logs/benchmark_<jobid>_rank<N>.yaml` (one file per rank/node).
+
+### Expected Performance
+
+- **Storage**: NVMe SSD (3-7 GB/s), Network FS (1-10 GB/s)
+- **Memory**: DDR4 (20-40 GB/s), DDR5 (40-80 GB/s)
+- **GPU (A100)**: ~1500-2000 GB/s memory, ~150-312 TFLOPS
+- **Network**: InfiniBand (12-25 GB/s, <2μs latency)
 
 ## File Structure
 
 ```
-├── train.py              # Main training script
+.
+├── train.py              # Training script
+├── benchmark.py          # Benchmark suite
+├── slurm_submit.sh      # Benchmarks + training job
+├── benchmark_only.sh    # Benchmarks only job
 ├── requirements.txt      # Dependencies
-├── slurm_submit.sh      # SLURM job script
-└── README.md            # This file
+├── logs/                 # Output logs (auto-generated)
+└── checkpoints/          # Model checkpoints (auto-generated)
 ```
 
 ## Troubleshooting
 
 ### Out of Memory
 
-Reduce per device batch size or sequence length in `train.py`:
+Reduce batch size or sequence length in `train.py`:
+
 ```python
-batch_size=1       # Instead of 16
-seq_length=256     # Instead of 512
+batch_size=1
+seq_length=256
 ```
 
-### Job Stuck in Queue
+### Job Issues
 
-Check available resources:
 ```bash
-sinfo              # Check cluster status
-squeue -u $USER    # Check your jobs
-```
-
-## Customization
-
-### Use Real Data
-
-Replace `DummyTextDataset` in `train.py`:
-
-```python
-from datasets import load_dataset
-dataset = load_dataset("your_dataset")
-```
-
-### Use Different Model
-
-Replace model creation in `train.py`:
-
-```python
-from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
+sinfo                      # Check cluster status
+squeue -u $USER            # Check your jobs
+scancel <jobid>            # Cancel a job
+tail -f logs/train_*.err   # Check errors
 ```
 
 ## Requirements
@@ -126,6 +131,4 @@ model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
 - SLURM cluster
 - uv package manager
 
-## License
-
-Demonstration code - free to use and modify.
+For more details on benchmarks, see `docs/BENCHMARK_FEATURES.md`.

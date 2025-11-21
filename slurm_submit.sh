@@ -31,6 +31,34 @@ export MASTER_PORT=29500
 
 echo "Master: $MASTER_ADDR:$MASTER_PORT"
 
+# ============================================================================
+# BENCHMARK PHASE - Test all system resources before training
+# ============================================================================
+echo ""
+echo "=============================================================================="
+echo "PHASE 1: Running comprehensive benchmarks"
+echo "=============================================================================="
+
+# Run benchmarks with distributed setup
+srun torchrun \
+    --nnodes=$SLURM_JOB_NUM_NODES \
+    --nproc_per_node=8 \
+    --rdzv_id=$SLURM_JOB_ID \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
+    benchmark.py
+
+echo ""
+echo "Benchmarks completed at: $(date)"
+echo ""
+
+# ============================================================================
+# TRAINING PHASE
+# ============================================================================
+echo "=============================================================================="
+echo "PHASE 2: Starting training"
+echo "=============================================================================="
+
 # Run training with torchrun via srun
 srun torchrun \
     --nnodes=$SLURM_JOB_NUM_NODES \
@@ -40,5 +68,6 @@ srun torchrun \
     --rdzv_endpoint=$MASTER_ADDR:$MASTER_PORT \
     train.py
 
+echo ""
 echo "Job finished at: $(date)"
 
