@@ -1,41 +1,136 @@
 #!/usr/bin/env python3
 """
 Simple FSDP Training Script with Transformers
-Uses dummy data for demonstration purposes.
+Uses HuggingFace datasets with caching support.
 """
 
 import os
 import time
 from datetime import datetime
+import multiprocessing
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import GPT2Config, GPT2LMHeadModel, GPT2Tokenizer
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import functools
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from datasets import load_dataset
 
 
-class DummyTextDataset(Dataset):
-    """Generate random token sequences for training."""
+def print_timing_box(rank_prefix, title, items):
+    """Print timing information in a visually distinct box."""
+    prefix_len = len(rank_prefix)
+    box_width = 70
+    content_width = box_width - prefix_len
+    print()  # Empty line before box
+    print(f"{rank_prefix}{'=' * content_width}")
+    print(f"{rank_prefix}{title:^{content_width}}")
+    print(f"{rank_prefix}{'-' * content_width}")
+    for item in items:
+        # Replace separator placeholder with actual separator
+        if item.startswith("---"):
+            print(f"{rank_prefix}{'-' * content_width}")
+        else:
+            print(f"{rank_prefix}{item}")
+    print(f"{rank_prefix}{'=' * content_width}")
+    print()  # Empty line after box
 
-    def __init__(self, num_samples=10000, seq_length=512, vocab_size=50257):
-        self.num_samples = num_samples
+
+class TextDataset(Dataset):
+    """Dataset wrapper for HuggingFace datasets with tokenization and caching."""
+
+    def __init__(self, dataset_name="Salesforce/wikitext", dataset_config="wikitext-103-raw-v1", 
+                 seq_length=512, cache_dir=None, rank=None):
+        """
+        Initialize dataset with caching support.
+        
+        Args:
+            dataset_name: Name of the HuggingFace dataset (default: 'Salesforce/wikitext')
+            dataset_config: Configuration name for the dataset (default: 'wikitext-103-raw-v1')
+            seq_length: Maximum sequence length for tokenization
+            cache_dir: Directory for caching datasets (None uses default ~/.cache/huggingface)
+            rank: Process rank for logging (optional)
+        """
         self.seq_length = seq_length
-        self.vocab_size = vocab_size
+        self.rank = rank
+        rank_prefix = f"[Rank {rank}] " if rank is not None else ""
+        
+        init_start_time = time.time()
+        
+        # Load tokenizer
+        tokenizer_start_time = time.time()
+        self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        tokenizer_time = time.time() - tokenizer_start_time
+        
+        # Load dataset with caching enabled
+        # HuggingFace datasets automatically cache downloaded and processed datasets
+        print(f"{rank_prefix}Loading dataset {dataset_name}/{dataset_config}...")
+        print(f"{rank_prefix}Cache directory: {cache_dir or 'default (~/.cache/huggingface)'}")
+        
+        dataset_load_start_time = time.time()
+        dataset = load_dataset(
+            dataset_name, 
+            dataset_config,
+            cache_dir=cache_dir,
+            split="train"
+        )
+        dataset_load_time = time.time() - dataset_load_start_time
+        
+        # Tokenize the dataset using all available processors
+        # This will be cached automatically by HuggingFace datasets
+        num_proc = os.cpu_count() or multiprocessing.cpu_count()
+        print(f"{rank_prefix}Tokenizing dataset using {num_proc} processors (this will be cached for future runs)...")
+        tokenize_start_time = time.time()
+        self.tokenized_dataset = dataset.map(
+            self._tokenize_function,
+            batched=True,
+            remove_columns=dataset.column_names,
+            desc="Tokenizing",
+            num_proc=num_proc
+        )
+        tokenize_time = time.time() - tokenize_start_time
+        
+        total_init_time = time.time() - init_start_time
+        
+        # Print timing information in a box
+        timing_items = [
+            f"Tokenizer loading:        {tokenizer_time:>8.2f}s",
+            f"Dataset load/download:    {dataset_load_time:>8.2f}s ({len(dataset):,} raw examples)",
+            f"Tokenization ({num_proc} procs):  {tokenize_time:>8.2f}s",
+            "---",  # Separator line
+            f"Total initialization:   {total_init_time:>8.2f}s",
+            f"Final dataset size:      {len(self.tokenized_dataset):,} examples"
+        ]
+        print_timing_box(rank_prefix, "DATASET LOADING TIMING", timing_items)
+
+    def _tokenize_function(self, examples):
+        """Tokenize text examples."""
+        # Tokenize and truncate/pad to seq_length
+        tokenized = self.tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=self.seq_length,
+            padding="max_length",
+            return_tensors=None  # Return lists, not tensors
+        )
+        # For language modeling, labels are the same as input_ids
+        tokenized["labels"] = tokenized["input_ids"].copy()
+        return tokenized
 
     def __len__(self):
-        return self.num_samples
+        return len(self.tokenized_dataset)
 
     def __getitem__(self, idx):
-        # Generate random token ids
-        tokens = torch.randint(0, self.vocab_size, (self.seq_length,))
+        item = self.tokenized_dataset[idx]
         return {
-            "input_ids": tokens,
-            "labels": tokens.clone(),  # For language modeling, labels = inputs shifted
+            "input_ids": torch.tensor(item["input_ids"], dtype=torch.long),
+            "labels": torch.tensor(item["labels"], dtype=torch.long),
         }
 
 
@@ -123,12 +218,27 @@ def train(rank, world_size, local_rank):
     # Create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
 
-    # Create dataset and dataloader
-    dataset = DummyTextDataset(num_samples=10000, seq_length=512)
+    # Create dataset and dataloader with caching support
+    # Set cache_dir to a shared location for multi-node setups, or None for default
+    print(f"[Rank {rank}] Starting dataset initialization...")
+    dataset_start_time = time.time()
+    cache_dir = os.environ.get("HF_DATASETS_CACHE", None)
+    dataset = TextDataset(
+        dataset_name="Salesforce/wikitext",
+        dataset_config="wikitext-103-raw-v1",
+        seq_length=512,
+        cache_dir=cache_dir,
+        rank=rank
+    )
+    dataset_init_time = time.time() - dataset_start_time
+    
+    sampler_start_time = time.time()
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
     )
+    sampler_time = time.time() - sampler_start_time
 
+    dataloader_start_time = time.time()
     dataloader = DataLoader(
         dataset,
         batch_size=16,  # Per-device batch size
@@ -136,11 +246,21 @@ def train(rank, world_size, local_rank):
         num_workers=4,
         pin_memory=True,
     )
-
-    print(f"[Rank {rank}] DataLoader created")
+    dataloader_time = time.time() - dataloader_start_time
+    
+    # Print dataloader timing in a box
+    rank_prefix = f"[Rank {rank}] "
+    dataloader_items = [
+        f"Dataset creation:         {dataset_init_time:>8.2f}s",
+        f"Sampler creation:         {sampler_time:>8.3f}s",
+        f"DataLoader creation:     {dataloader_time:>8.3f}s",
+        "---",  # Separator line
+        f"Total setup time:        {dataset_init_time + sampler_time + dataloader_time:>8.2f}s"
+    ]
+    print_timing_box(rank_prefix, "DATALOADER SETUP TIMING", dataloader_items)
 
     # Training loop
-    num_epochs = 3
+    num_epochs = 3000
     model.train()
 
     for epoch in range(num_epochs):

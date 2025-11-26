@@ -19,12 +19,12 @@ uv pip install -r requirements.txt
 ### Full Run (Benchmarks + Training)
 
 ```bash
-sbatch slurm_submit.sh
+sbatch --nodes 2 slurm_submit.sh
 ```
 
 This runs in two phases:
 1. **Benchmarks**: Tests storage, CPU, memory, GPU, and network
-2. **Training**: ~4B parameter GPT2-style model with FSDP
+2. **Training**: ~4B parameter GPT2-style model with FSDP on Salesforce/wikitext (wikitext-103-raw-v1) dataset
 
 ### Benchmarks Only
 
